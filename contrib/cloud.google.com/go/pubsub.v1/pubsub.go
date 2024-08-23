@@ -23,6 +23,7 @@ const componentName = "cloud.google.com/go/pubsub.v1"
 
 func init() {
 	telemetry.LoadIntegration(componentName)
+	tracer.MarkIntegrationImported(componentName)
 }
 
 // Publish publishes a message on the specified topic and returns a PublishResult.
@@ -43,7 +44,7 @@ func Publish(ctx context.Context, t *pubsub.Topic, msg *pubsub.Message, opts ...
 		tracer.Tag("ordering_key", msg.OrderingKey),
 		tracer.Tag(ext.Component, componentName),
 		tracer.Tag(ext.SpanKind, ext.SpanKindProducer),
-		tracer.Tag(ext.MessagingSystem, "googlepubsub"),
+		tracer.Tag(ext.MessagingSystem, ext.MessagingSystemGCPPubsub),
 	}
 	if cfg.serviceName != "" {
 		spanOpts = append(spanOpts, tracer.ServiceName(cfg.serviceName))
@@ -108,7 +109,7 @@ func WrapReceiveHandler(s *pubsub.Subscription, f func(context.Context, *pubsub.
 			tracer.Tag("publish_time", msg.PublishTime.String()),
 			tracer.Tag(ext.Component, componentName),
 			tracer.Tag(ext.SpanKind, ext.SpanKindConsumer),
-			tracer.Tag(ext.MessagingSystem, "googlepubsub"),
+			tracer.Tag(ext.MessagingSystem, ext.MessagingSystemGCPPubsub),
 			tracer.ChildOf(parentSpanCtx),
 		}
 		if cfg.serviceName != "" {

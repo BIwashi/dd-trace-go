@@ -10,6 +10,8 @@ import (
 	"math"
 	"strings"
 
+	"gopkg.in/DataDog/dd-trace-go.v1/datastreams"
+	"gopkg.in/DataDog/dd-trace-go.v1/datastreams/options"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
@@ -23,6 +25,7 @@ const componentName = "segmentio/kafka.go.v0"
 
 func init() {
 	telemetry.LoadIntegration(componentName)
+	tracer.MarkIntegrationImported("github.com/segmentio/kafka-go")
 }
 
 // NewReader calls kafka.NewReader and wraps the resulting Consumer.
@@ -45,6 +48,11 @@ func WrapReader(c *kafka.Reader, opts ...Option) *Reader {
 	if c.Config().Brokers != nil {
 		wrapped.bootstrapServers = strings.Join(c.Config().Brokers, ",")
 	}
+
+	if c.Config().GroupID != "" {
+		wrapped.groupID = c.Config().GroupID
+	}
+
 	log.Debug("contrib/segmentio/kafka-go.v0/kafka: Wrapping Reader: %#v", wrapped.cfg)
 	return wrapped
 }
@@ -52,6 +60,7 @@ func WrapReader(c *kafka.Reader, opts ...Option) *Reader {
 // A kafkaConfig struct holds information from the kafka config for span tags
 type kafkaConfig struct {
 	bootstrapServers string
+	groupID          string
 }
 
 // A Reader wraps a kafka.Reader.
@@ -71,7 +80,7 @@ func (r *Reader) startSpan(ctx context.Context, msg *kafka.Message) ddtrace.Span
 		tracer.Tag("offset", msg.Offset),
 		tracer.Tag(ext.Component, componentName),
 		tracer.Tag(ext.SpanKind, ext.SpanKindConsumer),
-		tracer.Tag(ext.MessagingSystem, "kafka"),
+		tracer.Tag(ext.MessagingSystem, ext.MessagingSystemKafka),
 		tracer.Tag(ext.KafkaBootstrapServers, r.bootstrapServers),
 		tracer.Measured(),
 	}
@@ -87,7 +96,7 @@ func (r *Reader) startSpan(ctx context.Context, msg *kafka.Message) ddtrace.Span
 	span, _ := tracer.StartSpanFromContext(ctx, r.cfg.consumerSpanName, opts...)
 	// reinject the span context so consumers can pick it up
 	if err := tracer.Inject(span.Context(), carrier); err != nil {
-		log.Debug("contrib/segmentio/kafka.go.v0: Failed to inject span context into carrier, %v", err)
+		log.Debug("contrib/segmentio/kafka.go.v0: Failed to inject span context into carrier in reader, %v", err)
 	}
 	return span
 }
@@ -114,6 +123,7 @@ func (r *Reader) ReadMessage(ctx context.Context) (kafka.Message, error) {
 		return kafka.Message{}, err
 	}
 	r.prev = r.startSpan(ctx, &msg)
+	setConsumeCheckpoint(r.cfg.dataStreamsEnabled, r.groupID, &msg)
 	return msg, nil
 }
 
@@ -128,7 +138,33 @@ func (r *Reader) FetchMessage(ctx context.Context) (kafka.Message, error) {
 		return msg, err
 	}
 	r.prev = r.startSpan(ctx, &msg)
+	setConsumeCheckpoint(r.cfg.dataStreamsEnabled, r.groupID, &msg)
 	return msg, nil
+}
+
+func setConsumeCheckpoint(enabled bool, groupID string, msg *kafka.Message) {
+	if !enabled || msg == nil {
+		return
+	}
+	edges := []string{"direction:in", "topic:" + msg.Topic, "type:kafka"}
+	if groupID != "" {
+		edges = append(edges, "group:"+groupID)
+	}
+	carrier := messageCarrier{msg}
+	ctx, ok := tracer.SetDataStreamsCheckpointWithParams(
+		datastreams.ExtractFromBase64Carrier(context.Background(), carrier),
+		options.CheckpointParams{PayloadSize: getConsumerMsgSize(msg)},
+		edges...,
+	)
+	if !ok {
+		return
+	}
+	datastreams.InjectToBase64Carrier(ctx, carrier)
+	if groupID != "" {
+		// only track Kafka lag if a consumer group is set.
+		// since there is no ack mechanism, we consider that messages read are committed right away.
+		tracer.TrackKafkaCommitOffset(groupID, msg.Topic, int32(msg.Partition), msg.Offset)
+	}
 }
 
 // WrapWriter wraps a kafka.Writer so requests are traced.
@@ -158,7 +194,7 @@ func (w *Writer) startSpan(ctx context.Context, msg *kafka.Message) ddtrace.Span
 		tracer.SpanType(ext.SpanTypeMessageProducer),
 		tracer.Tag(ext.Component, componentName),
 		tracer.Tag(ext.SpanKind, ext.SpanKindProducer),
-		tracer.Tag(ext.MessagingSystem, "kafka"),
+		tracer.Tag(ext.MessagingSystem, ext.MessagingSystemKafka),
 		tracer.Tag(ext.KafkaBootstrapServers, w.bootstrapServers),
 	}
 	if w.Writer.Topic != "" {
@@ -171,8 +207,9 @@ func (w *Writer) startSpan(ctx context.Context, msg *kafka.Message) ddtrace.Span
 	}
 	carrier := messageCarrier{msg}
 	span, _ := tracer.StartSpanFromContext(ctx, w.cfg.producerSpanName, opts...)
-	err := tracer.Inject(span.Context(), carrier)
-	log.Debug("contrib/segmentio/kafka.go.v0: Failed to inject span context into carrier, %v", err)
+	if err := tracer.Inject(span.Context(), carrier); err != nil {
+		log.Debug("contrib/segmentio/kafka.go.v0: Failed to inject span context into carrier in writer, %v", err)
+	}
 	return span
 }
 
@@ -189,10 +226,58 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...kafka.Message) error
 	spans := make([]ddtrace.Span, len(msgs))
 	for i := range msgs {
 		spans[i] = w.startSpan(ctx, &msgs[i])
+		setProduceCheckpoint(w.cfg.dataStreamsEnabled, &msgs[i], w.Writer)
 	}
 	err := w.Writer.WriteMessages(ctx, msgs...)
 	for i, span := range spans {
 		finishSpan(span, msgs[i].Partition, msgs[i].Offset, err)
 	}
 	return err
+}
+
+func setProduceCheckpoint(enabled bool, msg *kafka.Message, writer *kafka.Writer) {
+	if !enabled || msg == nil {
+		return
+	}
+
+	var topic string
+	if writer.Topic != "" {
+		topic = writer.Topic
+	} else {
+		topic = msg.Topic
+	}
+
+	edges := []string{"direction:out", "topic:" + topic, "type:kafka"}
+	carrier := messageCarrier{msg}
+	ctx, ok := tracer.SetDataStreamsCheckpointWithParams(
+		datastreams.ExtractFromBase64Carrier(context.Background(), carrier),
+		options.CheckpointParams{PayloadSize: getProducerMsgSize(msg)},
+		edges...,
+	)
+	if !ok {
+		return
+	}
+
+	// Headers will be dropped if the current protocol does not support them
+	datastreams.InjectToBase64Carrier(ctx, carrier)
+}
+
+func getProducerMsgSize(msg *kafka.Message) (size int64) {
+	for _, header := range msg.Headers {
+		size += int64(len(header.Key) + len(header.Value))
+	}
+	if msg.Value != nil {
+		size += int64(len(msg.Value))
+	}
+	if msg.Key != nil {
+		size += int64(len(msg.Key))
+	}
+	return size
+}
+
+func getConsumerMsgSize(msg *kafka.Message) (size int64) {
+	for _, header := range msg.Headers {
+		size += int64(len(header.Key) + len(header.Value))
+	}
+	return size + int64(len(msg.Value)+len(msg.Key))
 }

@@ -29,10 +29,10 @@ func TestOptions(t *testing.T) {
 	query := `{ name }`
 	for name, tt := range map[string]struct {
 		tracerOpts []Option
-		test       func(assert *assert.Assertions, root mocktracer.Span)
+		test       func(assert *assert.Assertions, root mocktracer.Span, spans []mocktracer.Span)
 	}{
 		"default": {
-			test: func(assert *assert.Assertions, root mocktracer.Span) {
+			test: func(assert *assert.Assertions, root mocktracer.Span, _ []mocktracer.Span) {
 				assert.Equal("graphql.query", root.OperationName())
 				assert.Equal(query, root.Tag(ext.ResourceName))
 				assert.Equal(defaultServiceName, root.Tag(ext.ServiceName))
@@ -43,26 +43,49 @@ func TestOptions(t *testing.T) {
 		},
 		"WithServiceName": {
 			tracerOpts: []Option{WithServiceName("TestServer")},
-			test: func(assert *assert.Assertions, root mocktracer.Span) {
+			test: func(assert *assert.Assertions, root mocktracer.Span, _ []mocktracer.Span) {
 				assert.Equal("TestServer", root.Tag(ext.ServiceName))
 			},
 		},
 		"WithAnalytics/true": {
 			tracerOpts: []Option{WithAnalytics(true)},
-			test: func(assert *assert.Assertions, root mocktracer.Span) {
+			test: func(assert *assert.Assertions, root mocktracer.Span, _ []mocktracer.Span) {
 				assert.Equal(1.0, root.Tag(ext.EventSampleRate))
 			},
 		},
 		"WithAnalytics/false": {
 			tracerOpts: []Option{WithAnalytics(false)},
-			test: func(assert *assert.Assertions, root mocktracer.Span) {
+			test: func(assert *assert.Assertions, root mocktracer.Span, _ []mocktracer.Span) {
 				assert.Nil(root.Tag(ext.EventSampleRate))
 			},
 		},
 		"WithAnalyticsRate": {
 			tracerOpts: []Option{WithAnalyticsRate(0.5)},
-			test: func(assert *assert.Assertions, root mocktracer.Span) {
+			test: func(assert *assert.Assertions, root mocktracer.Span, _ []mocktracer.Span) {
 				assert.Equal(0.5, root.Tag(ext.EventSampleRate))
+			},
+		},
+		"WithoutTraceTrivialResolvedFields": {
+			tracerOpts: []Option{WithoutTraceTrivialResolvedFields()},
+			test: func(assert *assert.Assertions, _ mocktracer.Span, spans []mocktracer.Span) {
+				var hasFieldOperation bool
+				for _, span := range spans {
+					if span.OperationName() == fieldOp {
+						hasFieldOperation = true
+						break
+					}
+				}
+				assert.Equal(false, hasFieldOperation)
+			},
+		},
+		"WithCustomTag": {
+			tracerOpts: []Option{
+				WithCustomTag("customTag1", "customValue1"),
+				WithCustomTag("customTag2", "customValue2"),
+			},
+			test: func(assert *assert.Assertions, root mocktracer.Span, _ []mocktracer.Span) {
+				assert.Equal("customValue1", root.Tag("customTag1"))
+				assert.Equal("customValue2", root.Tag("customTag2"))
 			},
 		},
 	} {
@@ -72,15 +95,46 @@ func TestOptions(t *testing.T) {
 			defer mt.Stop()
 			c := newTestClient(t, testserver.New(), NewTracer(tt.tracerOpts...))
 			c.MustPost(query, &testServerResponse{})
+			spans := mt.FinishedSpans()
 			var root mocktracer.Span
-			for _, span := range mt.FinishedSpans() {
+			for _, span := range spans {
 				if span.ParentID() == 0 {
 					root = span
 				}
 			}
 			assert.NotNil(root)
-			tt.test(assert, root)
+			tt.test(assert, root, spans)
 			assert.Nil(root.Tag(ext.Error))
+		})
+	}
+
+	// WithoutTraceIntrospectionQuery tested here since we are specifically checking against an IntrosepctionQuery operation.
+	query = `query IntrospectionQuery { __schema { queryType { name } } }`
+	for name, tt := range map[string]struct {
+		tracerOpts []Option
+		test       func(assert *assert.Assertions, spans []mocktracer.Span)
+	}{
+		"WithoutTraceIntrospectionQuery": {
+			tracerOpts: []Option{WithoutTraceIntrospectionQuery()},
+			test: func(assert *assert.Assertions, spans []mocktracer.Span) {
+				var hasFieldSpan bool
+				for _, span := range spans {
+					if span.OperationName() == fieldOp {
+						hasFieldSpan = true
+						break
+					}
+				}
+				assert.Equal(false, hasFieldSpan)
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert := assert.New(t)
+			mt := mocktracer.Start()
+			defer mt.Stop()
+			c := newTestClient(t, testserver.New(), NewTracer(tt.tracerOpts...))
+			c.MustPost(query, &testServerResponse{}, client.Operation("IntrospectionQuery"))
+			tt.test(assert, mt.FinishedSpans())
 		})
 	}
 }
@@ -143,8 +197,8 @@ func TestChildSpans(t *testing.T) {
 		opNames = append(opNames, span.OperationName())
 		assert.Equal("99designs/gqlgen", span.Tag(ext.Component))
 	}
-	assert.ElementsMatch(resNames, []string{readOp, validationOp, parsingOp, `{ name }`})
-	assert.ElementsMatch(opNames, []string{readOp, validationOp, parsingOp, "graphql.query"})
+	assert.ElementsMatch(resNames, []string{readOp, parsingOp, validationOp, "Query.name", `{ name }`})
+	assert.ElementsMatch(opNames, []string{readOp, parsingOp, validationOp, fieldOp, "graphql.query"})
 	assert.NotNil(root)
 	assert.Nil(root.Tag(ext.Error))
 }
@@ -162,38 +216,40 @@ func TestNamingSchema(t *testing.T) {
 		err := c.Post(`{ name }`, &testServerResponse{})
 		require.NoError(t, err)
 
-		err = c.Post(`mutation Name() { name }`, &testServerResponse{})
+		err = c.Post(`mutation Name { name }`, &testServerResponse{})
 		assert.ErrorContains(t, err, "mutations are not supported")
 
 		return mt.FinishedSpans()
 	})
 	assertOpV0 := func(t *testing.T, spans []mocktracer.Span) {
-		require.Len(t, spans, 8)
+		require.Len(t, spans, 9)
 		assert.Equal(t, "graphql.read", spans[0].OperationName())
 		assert.Equal(t, "graphql.parse", spans[1].OperationName())
 		assert.Equal(t, "graphql.validate", spans[2].OperationName())
-		assert.Equal(t, "graphql.query", spans[3].OperationName())
-		assert.Equal(t, "graphql.read", spans[4].OperationName())
-		assert.Equal(t, "graphql.parse", spans[5].OperationName())
-		assert.Equal(t, "graphql.validate", spans[6].OperationName())
-		assert.Equal(t, "graphql.mutation", spans[7].OperationName())
+		assert.Equal(t, "graphql.field", spans[3].OperationName())
+		assert.Equal(t, "graphql.query", spans[4].OperationName())
+		assert.Equal(t, "graphql.read", spans[5].OperationName())
+		assert.Equal(t, "graphql.parse", spans[6].OperationName())
+		assert.Equal(t, "graphql.validate", spans[7].OperationName())
+		assert.Equal(t, "graphql.mutation", spans[8].OperationName())
 	}
 	assertOpV1 := func(t *testing.T, spans []mocktracer.Span) {
-		require.Len(t, spans, 8)
+		require.Len(t, spans, 9)
 		assert.Equal(t, "graphql.read", spans[0].OperationName())
 		assert.Equal(t, "graphql.parse", spans[1].OperationName())
 		assert.Equal(t, "graphql.validate", spans[2].OperationName())
-		assert.Equal(t, "graphql.server.request", spans[3].OperationName())
-		assert.Equal(t, "graphql.read", spans[4].OperationName())
-		assert.Equal(t, "graphql.parse", spans[5].OperationName())
-		assert.Equal(t, "graphql.validate", spans[6].OperationName())
-		assert.Equal(t, "graphql.server.request", spans[7].OperationName())
+		assert.Equal(t, "graphql.field", spans[3].OperationName())
+		assert.Equal(t, "graphql.server.request", spans[4].OperationName())
+		assert.Equal(t, "graphql.read", spans[5].OperationName())
+		assert.Equal(t, "graphql.parse", spans[6].OperationName())
+		assert.Equal(t, "graphql.validate", spans[7].OperationName())
+		assert.Equal(t, "graphql.server.request", spans[8].OperationName())
 	}
 	serviceOverride := namingschematest.TestServiceOverride
 	wantServiceNameV0 := namingschematest.ServiceNameAssertions{
-		WithDefaults:             lists.RepeatString("graphql", 8),
-		WithDDService:            lists.RepeatString("graphql", 8),
-		WithDDServiceAndOverride: lists.RepeatString(serviceOverride, 8),
+		WithDefaults:             lists.RepeatString("graphql", 9),
+		WithDDService:            lists.RepeatString("graphql", 9),
+		WithDDServiceAndOverride: lists.RepeatString(serviceOverride, 9),
 	}
 	t.Run("ServiceName", namingschematest.NewServiceNameTest(genSpans, wantServiceNameV0))
 	t.Run("SpanName", namingschematest.NewSpanNameTest(genSpans, assertOpV0, assertOpV1))

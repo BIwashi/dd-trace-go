@@ -19,23 +19,22 @@ type clientConfig struct {
 	spanName      string
 	analyticsRate float64
 	skipRaw       bool
+	errCheck      func(err error) bool
 }
 
 // ClientOption represents an option that can be used to create or wrap a client.
 type ClientOption func(*clientConfig)
 
 func defaults(cfg *clientConfig) {
-	cfg.serviceName = namingschema.NewDefaultServiceName(
-		defaultServiceName,
-		namingschema.WithOverrideV0(defaultServiceName),
-	).GetName()
-	cfg.spanName = namingschema.NewRedisOutboundOp().GetName()
+	cfg.serviceName = namingschema.ServiceNameOverrideV0(defaultServiceName, defaultServiceName)
+	cfg.spanName = namingschema.OpName(namingschema.RedisOutbound)
 	// cfg.analyticsRate = globalconfig.AnalyticsRate()
 	if internal.BoolEnv("DD_TRACE_REDIS_ANALYTICS_ENABLED", false) {
 		cfg.analyticsRate = 1.0
 	} else {
 		cfg.analyticsRate = math.NaN()
 	}
+	cfg.errCheck = func(error) bool { return true }
 }
 
 // WithSkipRawCommand reports whether to skip setting the "redis.raw_command" tag
@@ -74,5 +73,13 @@ func WithAnalyticsRate(rate float64) ClientOption {
 		} else {
 			cfg.analyticsRate = math.NaN()
 		}
+	}
+}
+
+// WithErrorCheck specifies a function fn which determines whether the passed
+// error should be marked as an error.
+func WithErrorCheck(fn func(err error) bool) ClientOption {
+	return func(cfg *clientConfig) {
+		cfg.errCheck = fn
 	}
 }

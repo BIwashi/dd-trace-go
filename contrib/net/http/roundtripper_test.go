@@ -16,11 +16,14 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/DataDog/dd-trace-go.v1/appsec/events"
 	"gopkg.in/DataDog/dd-trace-go.v1/contrib/internal/namingschematest"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/mocktracer"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec/listener/httpsec"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/globalconfig"
 
 	"github.com/stretchr/testify/assert"
@@ -552,6 +555,36 @@ func TestSpanOptions(t *testing.T) {
 	assert.Equal(t, tagValue, spans[0].Tag(tagKey))
 }
 
+func TestRoundTripperPropagation(t *testing.T) {
+	mt := mocktracer.Start()
+	defer mt.Stop()
+
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		spanctx, err := tracer.Extract(tracer.HTTPHeadersCarrier(r.Header))
+		assert.ErrorIs(t, err, tracer.ErrSpanContextNotFound, "should not find headers injected in output")
+
+		assert.Empty(t, r.Header.Get(tracer.DefaultTraceIDHeader), "should not find trace_id in output header")
+		assert.Empty(t, r.Header.Get(tracer.DefaultParentIDHeader), "should not find parent_id in output header")
+
+		span := tracer.StartSpan("test",
+			tracer.ChildOf(spanctx))
+		defer span.Finish()
+
+		w.Write([]byte("Hello World"))
+	}))
+	defer s.Close()
+
+	rt := WrapRoundTripper(http.DefaultTransport,
+		RTWithPropagation(false))
+	client := &http.Client{
+		Transport: rt,
+	}
+
+	resp, err := client.Get(s.URL + "/hello/world")
+	assert.Nil(t, err)
+	defer resp.Body.Close()
+}
+
 func TestClientNamingSchema(t *testing.T) {
 	genSpans := namingschematest.GenSpansFn(func(t *testing.T, serviceOverride string) []mocktracer.Span {
 		var opts []RoundTripperOption
@@ -588,4 +621,80 @@ func TestClientNamingSchema(t *testing.T) {
 	}
 	t.Run("ServiceName", namingschematest.NewServiceNameTest(genSpans, wantServiceNameV0))
 	t.Run("SpanName", namingschematest.NewSpanNameTest(genSpans, assertOpV0, assertOpV1))
+}
+
+type emptyRoundTripper struct{}
+
+func (rt *emptyRoundTripper) RoundTrip(_ *http.Request) (*http.Response, error) {
+	recorder := httptest.NewRecorder()
+	recorder.WriteHeader(200)
+	return recorder.Result(), nil
+}
+
+func TestAppsec(t *testing.T) {
+	t.Setenv("DD_APPSEC_RULES", "../../../internal/appsec/testdata/rasp.json")
+
+	client := WrapRoundTripper(&emptyRoundTripper{})
+
+	for _, enabled := range []bool{true, false} {
+
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			t.Setenv("DD_APPSEC_RASP_ENABLED", strconv.FormatBool(enabled))
+
+			mt := mocktracer.Start()
+			defer mt.Stop()
+
+			appsec.Start()
+			if !appsec.Enabled() {
+				t.Skip("appsec not enabled")
+			}
+
+			defer appsec.Stop()
+
+			w := httptest.NewRecorder()
+			r, err := http.NewRequest("GET", "?value=169.254.169.254", nil)
+			require.NoError(t, err)
+
+			TraceAndServe(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				req, err := http.NewRequest("GET", "http://169.254.169.254", nil)
+				require.NoError(t, err)
+
+				resp, err := client.RoundTrip(req.WithContext(r.Context()))
+
+				if enabled {
+					require.True(t, events.IsSecurityError(err))
+				} else {
+					require.NoError(t, err)
+				}
+
+				if resp != nil {
+					defer resp.Body.Close()
+				}
+			}), w, r, &ServeConfig{
+				Service:  "service",
+				Resource: "resource",
+			})
+
+			spans := mt.FinishedSpans()
+			require.Len(t, spans, 2) // service entry serviceSpan & http request serviceSpan
+			serviceSpan := spans[1]
+
+			if !enabled {
+				require.NotContains(t, serviceSpan.Tags(), "_dd.appsec.json")
+				require.NotContains(t, serviceSpan.Tags(), "_dd.stack")
+				return
+			}
+
+			require.Contains(t, serviceSpan.Tags(), "_dd.appsec.json")
+			appsecJSON := serviceSpan.Tag("_dd.appsec.json")
+			require.Contains(t, appsecJSON, httpsec.ServerIoNetURLAddr)
+
+			require.Contains(t, serviceSpan.Tags(), "_dd.stack")
+			require.NotContains(t, serviceSpan.Tags(), "error.message")
+
+			// This is a nested event so it should contain the child span id in the service entry span
+			// TODO(eliott.bouhana): uncomment this once we have the child span id in the service entry span
+			// require.Contains(t, appsecJSON, `"span_id":`+strconv.FormatUint(requestSpan.SpanID(), 10))
+		})
+	}
 }

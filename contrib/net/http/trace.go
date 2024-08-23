@@ -11,11 +11,12 @@ import (
 	"net/http"
 
 	"gopkg.in/DataDog/dd-trace-go.v1/contrib/internal/httptrace"
+	"gopkg.in/DataDog/dd-trace-go.v1/contrib/internal/options"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec"
-	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec/dyngo/instrumentation/httpsec"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec/emitter/httpsec"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/telemetry"
 )
 
@@ -23,6 +24,7 @@ const componentName = "net/http"
 
 func init() {
 	telemetry.LoadIntegration(componentName)
+	tracer.MarkIntegrationImported(componentName)
 }
 
 // ServeConfig specifies the tracing configuration when using TraceAndServe.
@@ -52,7 +54,7 @@ func TraceAndServe(h http.Handler, w http.ResponseWriter, r *http.Request, cfg *
 	if cfg == nil {
 		cfg = new(ServeConfig)
 	}
-	opts := cfg.SpanOpts
+	opts := options.Copy(cfg.SpanOpts...) // make a copy of cfg.SpanOpts to avoid races
 	if cfg.Service != "" {
 		opts = append(opts, tracer.ServiceName(cfg.Service))
 	}
@@ -69,7 +71,7 @@ func TraceAndServe(h http.Handler, w http.ResponseWriter, r *http.Request, cfg *
 	}()
 
 	if appsec.Enabled() {
-		h = httpsec.WrapHandler(h, span, cfg.RouteParams)
+		h = httpsec.WrapHandler(h, span, cfg.RouteParams, nil)
 	}
 	h.ServeHTTP(rw, r.WithContext(ctx))
 }
@@ -108,4 +110,9 @@ func (w *responseWriter) WriteHeader(status int) {
 	}
 	w.ResponseWriter.WriteHeader(status)
 	w.status = status
+}
+
+// Unwrap returns the underlying wrapped http.ResponseWriter.
+func (w *responseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

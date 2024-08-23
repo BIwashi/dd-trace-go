@@ -14,51 +14,79 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestNewDefaultServiceName(t *testing.T) {
+func TestServiceName(t *testing.T) {
 	defaultServiceName := "default"
-	optOverrideV0 := namingschema.WithOverrideV0("override-v0")
 
 	testCases := []struct {
 		name          string
 		schemaVersion namingschema.Version
 		ddService     string
-		opts          []namingschema.Option
+		setup         func() func()
+		call          func() string
 		want          string
 	}{
 		{
-			name:          "schema v0",
+			name:          "v0",
 			schemaVersion: namingschema.SchemaV0,
 			ddService:     "",
-			opts:          nil,
+			call:          func() string { return namingschema.ServiceName(defaultServiceName) },
 			want:          "default",
 		},
 		{
-			name:          "schema v0 with DD_SERVICE",
+			name:          "v0-DD_SERVICE",
 			schemaVersion: namingschema.SchemaV0,
 			ddService:     "dd-service",
-			opts:          nil,
+			call:          func() string { return namingschema.ServiceName(defaultServiceName) },
 			want:          "dd-service",
 		},
 		{
-			name:          "schema v0 override",
+			name:          "v0-override",
 			schemaVersion: namingschema.SchemaV0,
 			ddService:     "dd-service",
-			opts:          []namingschema.Option{optOverrideV0},
+			call:          func() string { return namingschema.ServiceNameOverrideV0(defaultServiceName, "override-v0") },
 			want:          "override-v0",
 		},
 		{
-			name:          "schema v1",
+			name:          "v1",
 			schemaVersion: namingschema.SchemaV1,
 			ddService:     "",
-			opts:          nil,
+			call:          func() string { return namingschema.ServiceName(defaultServiceName) },
 			want:          "default",
 		},
 		{
-			name:          "schema v1 with DD_SERVICE",
+			name:          "v1-DD_SERVICE",
 			schemaVersion: namingschema.SchemaV1,
 			ddService:     "dd-service",
-			opts:          nil,
+			call:          func() string { return namingschema.ServiceName(defaultServiceName) },
 			want:          "dd-service",
+		},
+		{
+			name:          "v0-UseGlobalServiceName",
+			schemaVersion: namingschema.SchemaV0,
+			ddService:     "dd-service",
+			setup: func() func() {
+				prev := namingschema.UseGlobalServiceName()
+				namingschema.SetUseGlobalServiceName(true)
+				return func() {
+					namingschema.SetUseGlobalServiceName(prev)
+				}
+			},
+			call: func() string { return namingschema.ServiceNameOverrideV0(defaultServiceName, "override-v0") },
+			want: "dd-service",
+		},
+		{
+			name:          "v0-UseGlobalServiceName",
+			schemaVersion: namingschema.SchemaV1,
+			ddService:     "dd-service",
+			setup: func() func() {
+				prev := namingschema.UseGlobalServiceName()
+				namingschema.SetUseGlobalServiceName(true)
+				return func() {
+					namingschema.SetUseGlobalServiceName(prev)
+				}
+			},
+			call: func() string { return namingschema.ServiceNameOverrideV0(defaultServiceName, "override-v0") },
+			want: "dd-service",
 		},
 	}
 	for _, tc := range testCases {
@@ -67,14 +95,17 @@ func TestNewDefaultServiceName(t *testing.T) {
 			defer namingschema.SetVersion(version)
 			namingschema.SetVersion(tc.schemaVersion)
 
+			if tc.setup != nil {
+				cleanup := tc.setup()
+				defer cleanup()
+			}
 			if tc.ddService != "" {
 				svc := globalconfig.ServiceName()
 				defer globalconfig.SetServiceName(svc)
 				globalconfig.SetServiceName(tc.ddService)
 			}
-
-			s := namingschema.NewDefaultServiceName(defaultServiceName, tc.opts...)
-			assert.Equal(t, tc.want, s.GetName())
+			s := tc.call()
+			assert.Equal(t, tc.want, s)
 		})
 	}
 }

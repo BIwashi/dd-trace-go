@@ -6,17 +6,18 @@
 package grpc
 
 import (
+	"context"
+
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/log"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 type serverStream struct {
@@ -53,7 +54,7 @@ func (ss *serverStream) RecvMsg(m interface{}) (err error) {
 		defer func() {
 			withMetadataTags(ss.ctx, ss.cfg, span)
 			withRequestTags(ss.cfg, m, span)
-			finishWithError(span, err, ss.cfg)
+			finishWithError(span, err, ss.method, ss.cfg)
 		}()
 	}
 	err = ss.ServerStream.RecvMsg(m)
@@ -72,7 +73,7 @@ func (ss *serverStream) SendMsg(m interface{}) (err error) {
 			ss.cfg.startSpanOptions(tracer.Measured())...,
 		)
 		span.SetTag(ext.Component, componentName)
-		defer func() { finishWithError(span, err, ss.cfg) }()
+		defer func() { finishWithError(span, err, ss.method, ss.cfg) }()
 	}
 	err = ss.ServerStream.SendMsg(m)
 	return err
@@ -110,9 +111,9 @@ func StreamServerInterceptor(opts ...Option) grpc.StreamServerInterceptor {
 			case info.IsClientStream:
 				span.SetTag(tagMethodKind, methodKindClientStream)
 			}
-			defer func() { finishWithError(span, err, cfg) }()
+			defer func() { finishWithError(span, err, info.FullMethod, cfg) }()
 			if appsec.Enabled() {
-				handler = appsecStreamHandlerMiddleware(span, handler)
+				handler = appsecStreamHandlerMiddleware(info.FullMethod, span, handler)
 			}
 		}
 
@@ -154,10 +155,10 @@ func UnaryServerInterceptor(opts ...Option) grpc.UnaryServerInterceptor {
 		withMetadataTags(ctx, cfg, span)
 		withRequestTags(cfg, req, span)
 		if appsec.Enabled() {
-			handler = appsecUnaryHandlerMiddleware(span, handler)
+			handler = appsecUnaryHandlerMiddleware(info.FullMethod, span, handler)
 		}
 		resp, err := handler(ctx, req)
-		finishWithError(span, err, cfg)
+		finishWithError(span, err, info.FullMethod, cfg)
 		return resp, err
 	}
 }
@@ -175,10 +176,9 @@ func withMetadataTags(ctx context.Context, cfg *config, span ddtrace.Span) {
 
 func withRequestTags(cfg *config, req interface{}, span ddtrace.Span) {
 	if cfg.withRequestTags {
-		var m jsonpb.Marshaler
 		if p, ok := req.(proto.Message); ok {
-			if s, err := m.MarshalToString(p); err == nil {
-				span.SetTag(tagRequest, s)
+			if b, err := protojson.Marshal(p); err == nil {
+				span.SetTag(tagRequest, string(b))
 			}
 		}
 	}

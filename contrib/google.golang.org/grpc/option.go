@@ -9,6 +9,8 @@ import (
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/globalconfig"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/log"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/namingschema"
 
 	"google.golang.org/grpc/codes"
@@ -24,9 +26,10 @@ const (
 type Option func(*config)
 
 type config struct {
-	serviceName         string
+	serviceName         func() string
 	spanName            string
 	nonErrorCodes       map[codes.Code]bool
+	errCheck            func(method string, err error) bool
 	traceStreamCalls    bool
 	traceStreamMessages bool
 	noDebugStack        bool
@@ -35,6 +38,7 @@ type config struct {
 	withMetadataTags    bool
 	ignoredMetadata     map[string]struct{}
 	withRequestTags     bool
+	withErrorDetailTags bool
 	spanOpts            []ddtrace.StartSpanOption
 	tags                map[string]interface{}
 }
@@ -60,24 +64,31 @@ func defaults(cfg *config) {
 }
 
 func clientDefaults(cfg *config) {
-	cfg.serviceName = namingschema.NewDefaultServiceName(
-		defaultClientServiceName,
-		namingschema.WithOverrideV0(defaultClientServiceName),
-	).GetName()
-	cfg.spanName = namingschema.NewGRPCClientOp().GetName()
+	sn := namingschema.ServiceNameOverrideV0(defaultClientServiceName, defaultClientServiceName)
+	cfg.serviceName = func() string { return sn }
+	cfg.spanName = namingschema.OpName(namingschema.GRPCClient)
 	defaults(cfg)
 }
 
 func serverDefaults(cfg *config) {
-	cfg.serviceName = namingschema.NewDefaultServiceName(defaultServerServiceName).GetName()
-	cfg.spanName = namingschema.NewGRPCServerOp().GetName()
+	// We check for a configured service name, so we don't break users who are incorrectly creating their server
+	// before the call `tracer.Start()`
+	if globalconfig.ServiceName() != "" {
+		sn := namingschema.ServiceName(defaultServerServiceName)
+		cfg.serviceName = func() string { return sn }
+	} else {
+		log.Warn("No global service name was detected. GRPC Server may have been created before calling tracer.Start(). Will dynamically fetch service name for every span. " +
+			"Note this may have a slight performance cost, it is always recommended to start the tracer before initializing any traced packages.\n")
+		cfg.serviceName = func() string { return namingschema.ServiceName(defaultServerServiceName) }
+	}
+	cfg.spanName = namingschema.OpName(namingschema.GRPCServer)
 	defaults(cfg)
 }
 
 // WithServiceName sets the given service name for the intercepted client.
 func WithServiceName(name string) Option {
 	return func(cfg *config) {
-		cfg.serviceName = name
+		cfg.serviceName = func() string { return name }
 	}
 }
 
@@ -113,6 +124,15 @@ func NonErrorCodes(cs ...codes.Code) InterceptorOption {
 		for _, c := range cs {
 			cfg.nonErrorCodes[c] = true
 		}
+	}
+}
+
+// WithErrorCheck sets a custom function to determine whether an error should not be considered as an error for tracing purposes.
+// This function is evaluated when an error occurs, and if it returns true, the error will not be recorded in the trace.
+// f: A function taking the gRPC method and error as arguments, returning a boolean to indicate if the error should be ignored.
+func WithErrorCheck(f func(method string, err error) bool) Option {
+	return func(cfg *config) {
+		cfg.errCheck = f
 	}
 }
 
@@ -183,6 +203,13 @@ func WithIgnoredMetadata(ms ...string) Option {
 func WithRequestTags() Option {
 	return func(cfg *config) {
 		cfg.withRequestTags = true
+	}
+}
+
+// WithErrorDetailTags specifies whether gRPC responses details contain should be added to spans as tags.
+func WithErrorDetailTags() Option {
+	return func(cfg *config) {
+		cfg.withErrorDetailTags = true
 	}
 }
 

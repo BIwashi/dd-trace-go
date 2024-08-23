@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	pappsec "gopkg.in/DataDog/dd-trace-go.v1/appsec"
@@ -21,6 +22,7 @@ import (
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/globalconfig"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/normalizer"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -449,6 +451,93 @@ func TestAppSec(t *testing.T) {
 	})
 }
 
+func TestWithHeaderTags(t *testing.T) {
+	setupReq := func(opts ...Option) *http.Request {
+		router := chi.NewRouter()
+		router.Use(Middleware(opts...))
+
+		router.Get("/test", func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("test"))
+		})
+		r := httptest.NewRequest("GET", "/test", nil)
+		r.Header.Set("h!e@a-d.e*r", "val")
+		r.Header.Add("h!e@a-d.e*r", "val2")
+		r.Header.Set("2header", "2val")
+		r.Header.Set("3header", "3val")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		return r
+	}
+
+	t.Run("default-off", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+		htArgs := []string{"h!e@a-d.e*r", "2header", "3header"}
+		setupReq()
+		spans := mt.FinishedSpans()
+		assert := assert.New(t)
+		assert.Equal(len(spans), 1)
+		s := spans[0]
+		for _, arg := range htArgs {
+			_, tag := normalizer.HeaderTag(arg)
+			assert.NotContains(s.Tags(), tag)
+		}
+	})
+
+	t.Run("integration", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		htArgs := []string{"h!e@a-d.e*r", "2header:tag"}
+		r := setupReq(WithHeaderTags(htArgs))
+		spans := mt.FinishedSpans()
+		assert := assert.New(t)
+		assert.Equal(len(spans), 1)
+		s := spans[0]
+
+		for _, arg := range htArgs {
+			header, tag := normalizer.HeaderTag(arg)
+			assert.Equal(strings.Join(r.Header.Values(header), ","), s.Tags()[tag])
+		}
+	})
+
+	t.Run("global", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		header, tag := normalizer.HeaderTag("3header")
+		globalconfig.SetHeaderTag(header, tag)
+
+		r := setupReq()
+		spans := mt.FinishedSpans()
+		assert := assert.New(t)
+		assert.Equal(len(spans), 1)
+		s := spans[0]
+
+		assert.Equal(strings.Join(r.Header.Values(header), ","), s.Tags()[tag])
+	})
+
+	t.Run("override", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		globalH, globalT := normalizer.HeaderTag("3header")
+		globalconfig.SetHeaderTag(globalH, globalT)
+
+		htArgs := []string{"h!e@a-d.e*r", "2header:tag"}
+		r := setupReq(WithHeaderTags(htArgs))
+		spans := mt.FinishedSpans()
+		assert := assert.New(t)
+		assert.Equal(len(spans), 1)
+		s := spans[0]
+
+		for _, arg := range htArgs {
+			header, tag := normalizer.HeaderTag(arg)
+			assert.Equal(strings.Join(r.Header.Values(header), ","), s.Tags()[tag])
+		}
+		assert.NotContains(s.Tags(), globalT)
+	})
+}
 func TestNamingSchema(t *testing.T) {
 	genSpans := namingschematest.GenSpansFn(func(t *testing.T, serviceOverride string) []mocktracer.Span {
 		var opts []Option
@@ -516,4 +605,57 @@ func TestUnknownResourceName(t *testing.T) {
 	require.Equal(t, "", spans[0].Tag(ext.HTTPRoute))
 	require.Equal(t, "service-name", spans[0].Tag(ext.ServiceName))
 	require.Equal(t, "GET unknown", spans[0].Tag(ext.ResourceName))
+}
+
+// Highly concurrent test running many goroutines to try to uncover concurrency
+// issues such as deadlocks, data races, etc.
+func TestConcurrency(t *testing.T) {
+	mt := mocktracer.Start()
+	defer mt.Stop()
+
+	expectedCap := 10
+	opts := make([]Option, 0, expectedCap)
+	opts = append(opts, []Option{
+		WithServiceName("foobar"),
+		WithSpanOptions(tracer.Tag("tag1", "value1")),
+	}...)
+	expectedLen := 2
+
+	router := chi.NewRouter()
+	require.Len(t, opts, expectedLen)
+	require.True(t, cap(opts) == expectedCap)
+
+	router.Use(Middleware(opts...))
+	router.Get("/user/{id}", func(w http.ResponseWriter, r *http.Request) {
+		_, ok := tracer.SpanFromContext(r.Context())
+		require.True(t, ok)
+	})
+
+	// Create a bunch of goroutines that will all try to use the same router using our middleware
+	nbReqGoroutines := 1000
+	var startBarrier, finishBarrier sync.WaitGroup
+	startBarrier.Add(1)
+	finishBarrier.Add(nbReqGoroutines)
+
+	for n := 0; n < nbReqGoroutines; n++ {
+		go func() {
+			startBarrier.Wait()
+			defer finishBarrier.Done()
+
+			for i := 0; i < 100; i++ {
+				r := httptest.NewRequest("GET", "/user/123", nil)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, r)
+			}
+		}()
+	}
+
+	startBarrier.Done()
+	finishBarrier.Wait()
+
+	// Side effects on opts is not the main purpose of this test, but it's worth checking just in case.
+	require.Len(t, opts, expectedLen)
+	require.True(t, cap(opts) == expectedCap)
+	// All the others config data are internal to the closures in Middleware and cannot be tested.
+	// Running this test with -race is the best chance to find a concurrency issue.
 }

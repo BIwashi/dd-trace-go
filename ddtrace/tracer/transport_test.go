@@ -20,22 +20,24 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal"
 )
 
 // getTestSpan returns a Span with different fields set
 func getTestSpan() *span {
 	return &span{
-		TraceID:  42,
-		SpanID:   52,
-		ParentID: 42,
-		Type:     "web",
-		Service:  "high.throughput",
-		Name:     "sending.events",
-		Resource: "SEND /data",
-		Start:    1481215590883401105,
-		Duration: 1000000000,
-		Meta:     map[string]string{"http.host": "192.168.0.1"},
-		Metrics:  map[string]float64{"http.monitor": 41.99},
+		TraceID:    42,
+		SpanID:     52,
+		ParentID:   42,
+		Type:       "web",
+		Service:    "high.throughput",
+		Name:       "sending.events",
+		Resource:   "SEND /data",
+		Start:      1481215590883401105,
+		Duration:   1000000000,
+		Meta:       map[string]string{"http.host": "192.168.0.1"},
+		MetaStruct: map[string]any{"_dd.appsec.json": map[string]any{"triggers": []any{map[string]any{"id": "1"}}}},
+		Metrics:    map[string]float64{"http.monitor": 41.99},
 	}
 }
 
@@ -70,7 +72,7 @@ func TestTracesAgentIntegration(t *testing.T) {
 	}
 
 	for _, tc := range testCases {
-		transport := newHTTPTransport(defaultURL, defaultClient)
+		transport := newHTTPTransport(defaultURL, defaultHTTPClient(0))
 		p, err := encode(tc.payload)
 		assert.NoError(err)
 		_, err = transport.send(p)
@@ -96,14 +98,12 @@ func TestResolveAgentAddr(t *testing.T) {
 	} {
 		t.Run("", func(t *testing.T) {
 			if tt.envHost != "" {
-				os.Setenv("DD_AGENT_HOST", tt.envHost)
-				defer os.Unsetenv("DD_AGENT_HOST")
+				t.Setenv("DD_AGENT_HOST", tt.envHost)
 			}
 			if tt.envPort != "" {
-				os.Setenv("DD_TRACE_AGENT_PORT", tt.envPort)
-				defer os.Unsetenv("DD_TRACE_AGENT_PORT")
+				t.Setenv("DD_TRACE_AGENT_PORT", tt.envPort)
 			}
-			c.agentURL = resolveAgentAddr()
+			c.agentURL = internal.AgentURLFromEnv()
 			if tt.inOpt != nil {
 				tt.inOpt(c)
 			}
@@ -112,12 +112,12 @@ func TestResolveAgentAddr(t *testing.T) {
 	}
 
 	t.Run("UDS", func(t *testing.T) {
-		old := defaultSocketAPM
+		old := internal.DefaultTraceAgentUDSPath
 		d, err := os.Getwd()
 		require.NoError(t, err)
-		defaultSocketAPM = d // Choose a file we know will exist
-		defer func() { defaultSocketAPM = old }()
-		c.agentURL = resolveAgentAddr()
+		internal.DefaultTraceAgentUDSPath = d // Choose a file we know will exist
+		defer func() { internal.DefaultTraceAgentUDSPath = old }()
+		c.agentURL = internal.AgentURLFromEnv()
 		assert.Equal(t, &url.URL{Scheme: "unix", Path: d}, c.agentURL)
 	})
 }
@@ -140,7 +140,7 @@ func TestTransportResponse(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			assert := assert.New(t)
-			ln, err := net.Listen("tcp4", ":0")
+			ln, err := net.Listen("tcp4", "localhost:0")
 			assert.Nil(err)
 			go http.Serve(ln, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(tt.status)
@@ -148,7 +148,7 @@ func TestTransportResponse(t *testing.T) {
 			}))
 			defer ln.Close()
 			url := "http://" + ln.Addr().String()
-			transport := newHTTPTransport(url, defaultClient)
+			transport := newHTTPTransport(url, defaultHTTPClient(0))
 			rc, err := transport.send(newPayload())
 			if tt.err != "" {
 				assert.Equal(tt.err, err.Error())
@@ -188,7 +188,7 @@ func TestTraceCountHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 	for _, tc := range testCases {
-		transport := newHTTPTransport(srv.URL, defaultClient)
+		transport := newHTTPTransport(srv.URL, defaultHTTPClient(0))
 		p, err := encode(tc.payload)
 		assert.NoError(err)
 		_, err = transport.send(p)
@@ -256,7 +256,7 @@ func TestWithHTTPClient(t *testing.T) {
 	assert.NoError(err)
 	c := &http.Client{}
 	rt := wrapRecordingRoundTripper(c)
-	trc := newTracer(WithAgentAddr(u.Host), WithHTTPClient(c))
+	trc := newTracer(WithAgentTimeout(2), WithAgentAddr(u.Host), WithHTTPClient(c))
 	defer trc.Stop()
 
 	p, err := encode(getTestTrace(1, 1))

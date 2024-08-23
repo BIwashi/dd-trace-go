@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec/dyngo"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/version"
 )
 
@@ -100,9 +101,23 @@ var (
 
 func init() {
 	if v := os.Getenv("DD_LOGGING_RATE"); v != "" {
-		if sec, err := strconv.ParseUint(v, 10, 64); err != nil {
-			Warn("Invalid value for DD_LOGGING_RATE: %v", err)
+		setLoggingRate(v)
+	}
+
+	// This is required because we really want to be able to log errors from dyngo
+	// but the log package depend on too much packages that we want to instrument.
+	// So we need to do this to avoid dependency cycles.
+	dyngo.LogError = Error
+}
+
+func setLoggingRate(v string) {
+	if sec, err := strconv.ParseInt(v, 10, 64); err != nil {
+		Warn("Invalid value for DD_LOGGING_RATE: %v", err)
+	} else {
+		if sec < 0 {
+			Warn("Invalid value for DD_LOGGING_RATE: negative value")
 		} else {
+			// DD_LOGGING_RATE = 0 allows to log errors immediately.
 			errrate = time.Duration(sec) * time.Second
 		}
 	}

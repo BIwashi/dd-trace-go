@@ -27,6 +27,7 @@ const componentName = "twitchtv/twirp"
 
 func init() {
 	telemetry.LoadIntegration(componentName)
+	tracer.MarkIntegrationImported("github.com/twitchtv/twirp")
 }
 
 type (
@@ -171,10 +172,7 @@ func serverSpanName(ctx context.Context) string {
 	if svc, ok := twirp.ServiceName(ctx); ok {
 		serviceNameV0 = fmt.Sprintf("twirp.%s", svc)
 	}
-	return namingschema.NewServerInboundOp(
-		"twirp",
-		namingschema.WithOverrideV0(serviceNameV0),
-	).GetName()
+	return namingschema.OpNameOverrideV0(namingschema.TwirpServer, serviceNameV0)
 }
 
 func requestReceivedHook(cfg *config) func(context.Context) (context.Context, error) {

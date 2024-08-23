@@ -6,13 +6,12 @@
 package grpc
 
 import (
+	"context"
 	"net"
 
+	"google.golang.org/grpc/stats"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
-
-	context "golang.org/x/net/context"
-	"google.golang.org/grpc/stats"
 )
 
 // NewClientStatsHandler returns a gRPC client stats.Handler to trace RPC calls.
@@ -59,7 +58,8 @@ func (h *clientStatsHandler) HandleRPC(ctx context.Context, rs stats.RPCStats) {
 			span.SetTag(ext.TargetPort, port)
 		}
 	case *stats.End:
-		finishWithError(span, rs.Error, h.cfg)
+		fullMethod, _ := ctx.Value(fullMethodNameKey{}).(string)
+		finishWithError(span, rs.Error, fullMethod, h.cfg)
 	}
 }
 

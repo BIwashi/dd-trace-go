@@ -107,6 +107,7 @@ type mockspan struct {
 	parentID  uint64
 	context   *spanContext
 	tracer    *mocktracer
+	links     []ddtrace.SpanLink
 }
 
 // SetTag sets a given tag on the span.
@@ -217,6 +218,8 @@ func (s *mockspan) Finish(opts ...ddtrace.FinishOption) {
 
 // String implements fmt.Stringer.
 func (s *mockspan) String() string {
+	s.RLock()
+	defer s.RUnlock()
 	sc := s.context
 	return fmt.Sprintf(`
 name: %s
@@ -243,7 +246,9 @@ func (s *mockspan) SetUser(id string, opts ...tracer.UserMonitoringOption) {
 		return
 	}
 
-	var cfg tracer.UserMonitoringConfig
+	cfg := tracer.UserMonitoringConfig{
+		Metadata: make(map[string]string),
+	}
 	for _, fn := range opts {
 		fn(&cfg)
 	}
@@ -254,6 +259,10 @@ func (s *mockspan) SetUser(id string, opts ...tracer.UserMonitoringOption) {
 	root.SetTag("usr.role", cfg.Role)
 	root.SetTag("usr.scope", cfg.Scope)
 	root.SetTag("usr.session_id", cfg.SessionID)
+
+	for k, v := range cfg.Metadata {
+		root.SetTag(fmt.Sprintf("usr.%s", k), v)
+	}
 }
 
 // Root walks the span up to the root parent span and returns it.
